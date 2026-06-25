@@ -1,0 +1,220 @@
+﻿# ===============================================================
+#   100 keV PKA CASCADE SIMULATION + Uniaxial Tension (Y direction)
+#   Fe–Cr–He system | ZBL + EAM | ballistic → thermal spike → recovery → tension
+# ===============================================================
+
+# ---------------- Units and Atom Style ----------------
+units           metal
+atom_style      atomic
+boundary        p p p
+
+# ---------------- Variables ----------------
+variable T0        equal 300
+variable seed      equal 123456
+variable mass_Fe   equal 55.845
+
+# ---------------- Read Structure ----------------
+read_data       Fe9Cr.lmp
+
+# ---------------- Define Groups ----------------
+group pka id 239972
+group Fe  type 1
+group Cr  type 2
+group He  type 3
+
+# Entire system participates in cascade (no thermostats)
+#group mobile subtract all pka
+# Entire system participates in cascade (include PKA)
+#group mobile all
+
+# ---------------- Interatomic Potential ----------------
+pair_style  hybrid/overlay eam/alloy zbl 0.1 2.0
+pair_coeff  * * eam/alloy fecrhe-CD-EAM-Lammps-v4.21.fcn Fe Cr NULL
+pair_coeff  1 1 zbl 26.0 26.0
+pair_coeff  1 2 zbl 26.0 24.0
+pair_coeff  2 2 zbl 24.0 24.0
+pair_coeff  1 3 zbl 26.0 2.0
+pair_coeff  2 3 zbl 24.0 2.0
+pair_coeff  3 3 zbl 2.0 2.0
+pair_modify mix arithmetic shift yes
+
+neighbor    2.0 bin
+neigh_modify every 1 delay 0 check yes
+
+# ===============================================================
+# Create thermostat boundary layer
+# ===============================================================
+
+variable t equal 10
+
+# ---- 计算盒子边界 ----
+variable xlo equal xlo
+variable xhi equal xhi
+variable ylo equal ylo
+variable yhi equal yhi
+variable zlo equal zlo
+variable zhi equal zhi
+
+variable xright equal v_xhi-${t}
+variable ytop   equal v_yhi-${t}
+variable zback  equal v_zhi-${t}
+
+# ---- 定义六个边界区域 ----
+region left   block EDGE ${t} INF INF INF INF units box
+region right  block ${xright} EDGE INF INF INF INF units box
+
+region bottom block INF INF EDGE ${t} INF INF units box
+region top    block INF INF ${ytop} EDGE INF INF units box
+
+region front  block INF INF INF INF EDGE ${t} units box
+region back   block INF INF INF INF ${zback} EDGE units box
+
+# ---- 生成group ----
+group leftg   region left
+group rightg  region right
+group bottomg region bottom
+group topg    region top
+group frontg  region front
+group backg   region back
+
+# ---- 合并thermostat层 ----
+group thermostats union leftg rightg bottomg topg frontg backg
+
+# ---- cascade核心区域 ----
+group mobile subtract all thermostats
+# ===============================================================
+#                 ENERGY MINIMIZATION & EQUILIBRATION
+# ===============================================================
+thermo_style custom step pe press
+thermo 200
+thermo_modify norm no
+
+min_style cg
+minimize 1.0e-6 1.0e-6 10000 10000
+reset_timestep 0
+
+timestep 0.001
+velocity all create ${T0} ${seed} mom yes rot yes dist gaussian
+fix fix_eq all npt temp ${T0} ${T0} 0.5 iso 0.0 0.0 5.0
+run 20000
+unfix fix_eq
+reset_timestep 0
+
+# ===============================================================
+#                PKA INITIALIZATION (100 keV)
+# ===============================================================
+variable v_pka equal 5876.0  # 100 keV Fe atom speed (Å/ps)
+#velocity pka set ${v_pka} 0.0 0.0 sum yes units box
+velocity pka set ${v_pka} 0.0 0.0  units box
+
+# ---------------- Computes ----------------
+#compute c_temp all temp
+group nonpka subtract all pka
+compute c_temp nonpka temp
+#thermo_modify temp c_temp
+compute c_ke_pka pka ke/atom
+compute c_ke_pka_sum pka reduce sum c_c_ke_pka
+
+thermo_style custom step c_c_temp c_c_ke_pka_sum etotal pe ke press
+thermo 500
+thermo_modify norm no
+
+# ---------------- Dumps ----------------
+dump dump_cascade all cfg 400 dump.cascade_*.cfg mass type xs ys zs vx vy vz
+dump_modify dump_cascade element Fe Cr He
+
+# ===============================================================
+#                  CASCADE SIMULATION STAGES
+# ===============================================================
+
+# ---------- Stage 1: Ballistic phase (0–0.2 ps) ----------
+timestep 0.00005
+#fix fix_ballistic mobile nve
+fix fix_ballistic all nve
+run 4000
+unfix fix_ballistic
+
+# ---------- Stage 2: Thermal spike (0.2–2 ps) ----------
+timestep 0.0001
+#fix fix_spike mobile nve
+fix fix_spike all nve
+run 16000
+unfix fix_spike
+
+# ---------- Stage 3: Recovery + heat removal (2–20 ps) ----------
+timestep 0.001
+#fix fix_recovery mobile nve
+fix fix_recovery all nve
+fix bath thermostats langevin 300 300 0.1 12345
+run 23200
+unfix fix_recovery
+unfix bath
+
+undump dump_cascade
+
+# ===============================================================
+#             FINAL RELAXATION & DEFECT OUTPUT
+# ===============================================================
+timestep 0.001
+fix fix_relax all npt temp ${T0} ${T0} 1.0 iso 0.0 0.0 10.0
+run 20000
+unfix fix_relax
+
+# ---- defect analysis helpers ----
+compute c_cna all cna/atom 3.4
+compute c_cs  all centro/atom 8
+compute c_disp all displace/atom
+
+dump dump_final all custom 1000 dump.relaxed.cfg mass id type x y z c_c_cna c_c_cs c_c_disp[1] c_c_disp[2] c_c_disp[3]
+dump_modify dump_final element Fe Cr He
+run 1
+undump dump_final
+
+# ===============================================================
+#               UNIAXIAL TENSION TEST (along Y)
+# ===============================================================
+print "===== Start Uniaxial Tension Test (along Y) ====="
+
+# ----- 记录初始盒长（Y方向） -----
+variable tmp equal "ly"
+variable L0 equal ${tmp}
+print "Initial box length (Y) L0 = ${L0}"
+
+reset_timestep 0
+timestep 0.001
+
+# ----- 控温与横向压力控制 -----
+# 让 X、Z 保持零压，只在 Y 拉伸
+fix fix_tension_npt all npt temp 300 300 1 x 0 0 1 z 0 0 1 drag 1
+
+# ----- 定义应变率 -----
+variable srate equal 1.0e9          # s^-1
+variable srate_ps equal "v_srate / 1.0e12"
+
+# ----- 沿 Y 方向拉伸 -----
+fix fix_tension_deform all deform 1 y erate ${srate_ps} units box remap v
+
+# ----- 定义应变与应力 -----
+variable strain equal "(ly - v_L0)/v_L0"
+variable sigma_x equal "-pxx/10000"
+variable sigma_y equal "-pyy/10000"
+variable sigma_z equal "-pzz/10000"
+
+# ----- 输出应力-应变 -----
+fix fix_output all print 200 "${strain} ${sigma_x} ${sigma_y} ${sigma_z}" file stress_strain_y.txt screen no
+
+# ----- 输出原子构型 -----
+dump dump_tension_cfg all cfg 2000 dump.tension_y_*.cfg mass type xs ys zs c_c_cna c_c_cs c_c_disp[1] c_c_disp[2] c_c_disp[3]
+dump_modify dump_tension_cfg element Fe Cr He
+
+dump dump_tension_atom all atom 4000 dump.tension_y_atom
+
+# ----- Thermo 输出 -----
+thermo 500
+thermo_style custom step v_strain temp v_sigma_x v_sigma_y v_sigma_z ke pe etotal press
+thermo_modify lost ignore flush yes
+
+# ----- 拉伸运行 -----
+run 200000
+
+print "===== Uniaxial tension along Y completed successfully ====="
